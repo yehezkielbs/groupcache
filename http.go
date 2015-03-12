@@ -140,6 +140,10 @@ func (p *HTTPPool) PickPeer(key string) (ProtoGetter, bool) {
 	return nil, false
 }
 
+func (p *HTTPPool) GetAllPeers() (peers map[string]*httpGetter) {
+	return p.httpGetters
+}
+
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse request.
 	if !strings.HasPrefix(r.URL.Path, p.basePath) {
@@ -159,27 +163,32 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such group: "+groupName, http.StatusNotFound)
 		return
 	}
-	var ctx Context
-	if p.Context != nil {
-		ctx = p.Context(r)
-	}
 
-	group.Stats.ServerRequests.Add(1)
-	var value []byte
-	err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	switch r.Method {
+	case "GET":
+		var ctx Context
+		if p.Context != nil {
+			ctx = p.Context(r)
+		}
+		group.Stats.ServerRequests.Add(1)
+		var value []byte
+		err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	// Write the value to the response body as a proto message.
-	body, err := proto.Marshal(&pb.GetResponse{Value: value})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		// Write the value to the response body as a proto message.
+		body, err := proto.Marshal(&pb.GetResponse{Value: value})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Write(body)
+	case "DELETE":
+		group.removeByPeer(key)
 	}
-	w.Header().Set("Content-Type", "application/x-protobuf")
-	w.Write(body)
 }
 
 type httpGetter struct {
@@ -191,14 +200,14 @@ var bufferPool = sync.Pool{
 	New: func() interface{} { return new(bytes.Buffer) },
 }
 
-func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse) error {
+func (h *httpGetter) call(context Context, in *pb.GetRequest, out *pb.GetResponse, method string) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",
 		h.baseURL,
 		url.QueryEscape(in.GetGroup()),
 		url.QueryEscape(in.GetKey()),
 	)
-	req, err := http.NewRequest("GET", u, nil)
+	req, err := http.NewRequest(method, u, nil)
 	if err != nil {
 		return err
 	}
@@ -226,4 +235,12 @@ func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse
 		return fmt.Errorf("decoding response body: %v", err)
 	}
 	return nil
+}
+
+func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse) error {
+	return h.call(context, in, out, "GET")
+}
+
+func (h *httpGetter) Delete(context Context, in *pb.GetRequest, out *pb.GetResponse) error {
+	return h.call(context, in, out, "DELETE")
 }

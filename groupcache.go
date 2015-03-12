@@ -26,6 +26,7 @@ package groupcache
 
 import (
 	"errors"
+	"log"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -219,6 +220,78 @@ func (g *Group) Get(ctx Context, key string, dest Sink) error {
 		return nil
 	}
 	return setSinkView(dest, value)
+}
+
+func (g *Group) removeFromMyself(key string) {
+	if g.mainCache.lru != nil {
+		g.mainCache.lru.Remove(key)
+	}
+	if g.hotCache.lru != nil {
+		g.hotCache.lru.Remove(key)
+	}
+}
+
+func (g *Group) removeFromGroup(key string) {
+	g.removeFromMyself(key)
+
+	peers := g.peers.GetAllPeers()
+	//Todo: this should be done in parallel
+	for _, peer := range peers {
+		req := &pb.GetRequest{
+			Group: &g.name,
+			Key:   &key,
+		}
+		res := &pb.GetResponse{}
+		err := peer.Delete(nil, req, res)
+		if err != nil {
+			log.Println("Delete " + key + " from peer failed: " + err.Error())
+		}
+	}
+}
+
+func (g *Group) Remove(key string) {
+	g.peersOnce.Do(g.initPeers)
+
+	//App calling for key removal
+	p, ok := g.peers.PickPeer(key)
+	if ok {
+		//I'm not the owner, call the owner for removal
+		req := &pb.GetRequest{
+			Group: &g.name,
+			Key:   &key,
+		}
+		res := &pb.GetResponse{}
+		err := p.Delete(nil, req, res)
+		if err != nil {
+			log.Println("Delete " + key + " from owner peer failed: " + err.Error())
+			//Let's act as the owner
+			g.removeFromGroup(key)
+		}
+		return
+	}
+
+	//I'm the owner
+	g.removeFromGroup(key)
+}
+
+func (g *Group) removeByPeer(key string) {
+	g.peersOnce.Do(g.initPeers)
+	_, ok := g.peers.PickPeer(key)
+	if ok {
+		//Peer calling for removal, and I'm not the owner
+		g.removeFromMyself(key)
+		return
+	}
+
+	//I'm the owner, remove from group
+	g.removeFromGroup(key)
+}
+
+func (g *Group) FlushAll() {
+	mu.RLock()
+	g.mainCache = cache{}
+	g.hotCache = cache{}
+	mu.RUnlock()
 }
 
 // load loads key either by invoking the getter locally or by sending it to another machine.
